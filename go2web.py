@@ -1,424 +1,387 @@
 #!/usr/bin/env python3
-import argparse
+import sys
 import socket
-import ssl
+import urllib.parse
 import re
-import os
+from html.parser import HTMLParser
 import json
+import os
 import time
-import html
-import random
+import ssl
 import gzip
 import io
-from urllib.parse import urlparse, urlencode, quote_plus
+import zlib
+import html
+from argparse import ArgumentParser, RawDescriptionHelpFormatter
 
-# Constants
-USER_AGENT_LIST = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/119.0"
-]
-USER_AGENT = random.choice(USER_AGENT_LIST)
-CACHE_DIR = os.path.join(os.path.expanduser("~"), ".go2web_cache")
-CACHE_EXPIRY = 3600  # Cache expiry in seconds (1 hour)
-
-# Cache mechanism
-class HttpCache:
+class HTMLTextExtractor(HTMLParser):
     def __init__(self):
-        if not os.path.exists(CACHE_DIR):
-            os.makedirs(CACHE_DIR)
-    
-    def _get_cache_filename(self, url):
-        return os.path.join(CACHE_DIR, quote_plus(url))
-    
-    def get(self, url):
-        cache_file = self._get_cache_filename(url)
-        if os.path.exists(cache_file):
-            # Check if cache is still valid
-            file_time = os.path.getmtime(cache_file)
-            if time.time() - file_time < CACHE_EXPIRY:
-                with open(cache_file, 'r', encoding='utf-8', errors='replace') as f:
-                    cached_data = json.load(f)
-                    return cached_data['headers'], cached_data['content']
-        return None, None
-    
-    def set(self, url, headers, content):
-        cache_file = self._get_cache_filename(url)
-        try:
-            with open(cache_file, 'w', encoding='utf-8', errors='replace') as f:
-                json.dump({
-                    'headers': headers,
-                    'content': content
-                }, f)
-        except Exception as e:
-            print(f"Warning: Failed to cache response: {e}")
+        super().__init__()
+        self.reset()
+        self.strict = False
+        self.convert_charrefs = True
+        self.text = []
+        self.skip_tags = ['script', 'style', 'head', 'meta', 'link']
+        self.current_tag = None
+        self.current_attrs = None
+        self.bold = False
+        self.italic = False
+        self.link_url = None
 
-# Enhanced URL handling
-def normalize_url(url):
-    """Normalize URL by adding scheme if missing"""
-    if not url:
-        return None
+    def handle_starttag(self, tag, attrs):
+        self.current_tag = tag
+        self.current_attrs = dict(attrs)
         
-    # If no protocol specified, add http://
-    if not url.startswith(('http://', 'https://')):
-        if url.startswith('www.'):
-            url = 'https://' + url
-        else:
-            url = 'https://www.' + url
-    
-    # Make sure URL has a path
-    parsed = urlparse(url)
-    if not parsed.path:
-        url += '/'
+        if tag == 'strong' or tag == 'b':
+            self.bold = True
+        elif tag == 'em' or tag == 'i':
+            self.italic = True
+        elif tag == 'a' and 'href' in self.current_attrs:
+            self.link_url = self.current_attrs['href']
+            
 
-    return url
+    def handle_endtag(self, tag):
+        if tag == 'strong' or tag == 'b':
+            self.bold = False
+        elif tag == 'em' or tag == 'i':
+            self.italic = False
+        elif tag == 'a':
+            self.link_url = None
+            
+        self.current_tag = None
+        if tag in ['p', 'br', 'div', 'section', 'article', 'li']:
+            self.text.append('\n')
 
-class HttpClient:
-    def __init__(self):
-        self.cookies = {}
-        self.cf_retries = 0
+    def handle_data(self, d):
+        if self.current_tag not in self.skip_tags and d.strip():
+            text = d.strip()
+            
+            # Apply formatting
+            if self.bold:
+                text = f'*{text}*'
+            if self.italic:
+                text = f'_{text}_'
+                
+            # Handle links
+            if self.link_url and self.current_tag == 'a':
+                text = f'{text} ({self.link_url})'
+                
+            self.text.append(text.strip())
 
-    def make_request(self, url, headers=None, follow_redirects=True, method="GET", body=None, referer=None):
-        url = self.normalize_url(url)
-        if not url:
-            return {}, "Invalid URL"
+    def get_text(self):
+        return ' '.join(self.text)
 
-        parsed_url = urlparse(url)
-        host = parsed_url.netloc
-        path = parsed_url.path if parsed_url.path else "/"
-        if parsed_url.query:
-            path += "?" + parsed_url.query
+class HTTPClient:
+    @staticmethod
+    def parse_url(url):
+        if not url.startswith('http://') and not url.startswith('https://'):
+            url = 'http://' + url
+        
+        parsed = urllib.parse.urlparse(url)
+        host = parsed.netloc
+        path = parsed.path if parsed.path else '/'
+        if parsed.query:
+            path += '?' + parsed.query
+        return host, path, parsed.scheme == 'https'
 
-        port = 443 if parsed_url.scheme == "https" else 80
-
-        headers = headers.copy() if headers else {}
-        headers['User-Agent'] = USER_AGENT
-        headers['Host'] = host
-        if referer:
-            headers['Referer'] = referer
-
-        # Add more headers for better compatibility
-        headers.setdefault('Accept', 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8')
-        headers.setdefault('Accept-Language', 'en-US,en;q=0.9')
-        headers.setdefault('Accept-Encoding', 'gzip, deflate')
-
-        request = f"{method} {path} HTTP/1.1\r\n"
-        for header_name, header_value in headers.items():
-            request += f"{header_name}: {header_value}\r\n"
-        request += "Connection: close\r\n\r\n"
-
-        if body:
-            request += body
-
+    @staticmethod
+    def make_request(host, path, headers=None, method='GET', https=False):
+        port = 443 if https else 80
+        
+        # Create socket connection
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(15)
-
-        try:
-            if parsed_url.scheme == "https":
-                context = ssl.create_default_context()
-                sock = context.wrap_socket(sock, server_hostname=host)
-
-            sock.connect((host, port))
-            sock.sendall(request.encode())
-
-            response = b""
-            while True:
-                try:
-                    data = sock.recv(8192)
-                    if not data:
-                        break
-                    response += data
-                except socket.timeout:
+        sock.settimeout(10)
+        
+        if https:
+            context = ssl.create_default_context()
+            sock = context.wrap_socket(sock, server_hostname=host)
+        
+        sock.connect((host, port))
+        
+        # Build request
+        request_lines = [
+            f'{method} {path} HTTP/1.1',
+            f'Host: {host}',
+            'Connection: close',
+            'User-Agent: go2web/1.0'
+        ]
+        
+        if headers:
+            for key, value in headers.items():
+                request_lines.append(f'{key}: {value}')
+        
+        request = '\r\n'.join(request_lines) + '\r\n\r\n'
+        
+        # Send request
+        sock.sendall(request.encode())
+        
+        # Receive response
+        response = b''
+        while True:
+            try:
+                chunk = sock.recv(4096)
+                if not chunk:
                     break
-
-            if not response:
-                return {}, "No response received from server."
-
-            # Split headers and body as bytes
-            header_end = response.find(b'\r\n\r\n')
-            if header_end == -1:
-                return {}, "Invalid HTTP response"
-
-            headers_part = response[:header_end]
-            body_part = response[header_end + 4:]
-
-            # Parse headers
-            headers_str = headers_part.decode('utf-8', errors='replace')
-            headers_lines = headers_str.split('\r\n')
-            status_line = headers_lines[0]
-            headers = {}
-            for line in headers_lines[1:]:
-                if ': ' in line:
-                    name, value = line.split(': ', 1)
-                    headers[name.lower()] = value
-
-            # Handle gzip/deflate content
-            content_encoding = headers.get('content-encoding', '').lower()
-            if 'gzip' in content_encoding:
-                try:
-                    buf = io.BytesIO(body_part)
-                    with gzip.GzipFile(fileobj=buf) as f:
-                        body = f.read().decode('utf-8', errors='replace')
-                except Exception as e:
-                    body = body_part.decode('utf-8', errors='replace')
-            elif 'deflate' in content_encoding:
-                body = body_part.decode('utf-8', errors='replace')
-            else:
-                charset = 'utf-8'
-                content_type = headers.get('content-type', '')
-                if 'charset=' in content_type:
-                    charset = content_type.split('charset=')[-1].split(';')[0].strip()
-                try:
-                    body = body_part.decode(charset, errors='replace')
-                except LookupError:
-                    body = body_part.decode('utf-8', errors='replace')
-
-            status_code = int(status_line.split()[1])
-            if follow_redirects and status_code in (301, 302, 303, 307, 308) and 'location' in headers:
-                redirect_url = headers['location']
-                print(f"Redirecting to: {redirect_url}")
-                return self.make_request(redirect_url, headers, follow_redirects, method, body, referer=url)
-
-            return headers, body
-
-        except Exception as e:
-            return {}, f"Error connecting to {url}: {str(e)}"
-        finally:
-            sock.close()
-
-
-    def normalize_url(self, url):
-        """Normalize URL by adding scheme if missing"""
-        if not url:
-            return None
-        if not url.startswith(('http://', 'https://')):
-            if url.startswith('www.'):
-                url = 'https://' + url
-            else:
-                url = 'https://www.' + url
-        return url
-
-# Improved HTML Content Processing
-class HtmlProcessor:
-    def __init__(self, base_url):
-        self.base_url = base_url
-        self.in_script = False
-        self.in_style = False
-        self.in_head = False
-        self.in_comment = False
-        self.output_buffer = []
-        self.current_text = []
-        self.links = []
-        self.current_link = None
-        self.title = None
+                response += chunk
+            except socket.timeout:
+                break
         
-    def process_html(self, html_content):
-        # Simple state machine to parse HTML
-        i = 0
-        while i < len(html_content):
-            # Check for comments
-            if i+4 <= len(html_content) and html_content[i:i+4] == '<!--':
-                self.in_comment = True
-                i += 4
-                continue
-            
-            if self.in_comment and i+3 <= len(html_content) and html_content[i:i+3] == '-->':
-                self.in_comment = False
-                i += 3
-                continue
-            
-            if self.in_comment:
-                i += 1
-                continue
-            
-            # Check for tag start
-            if html_content[i:i+1] == '<':
-                # Flush accumulated text
-                if self.current_text:
-                    text = ''.join(self.current_text).strip()
-                    if text and not self.in_script and not self.in_style and not self.in_head:
-                        if self.current_link:
-                            self.links.append((text, self.current_link))
-                            self.current_link = None
-                        else:
-                            self.output_buffer.append(text)
-                    self.current_text = []
-                
-                # Find tag end
-                tag_end = html_content.find('>', i)
-                if tag_end == -1:
-                    i += 1
-                    continue
-                
-                tag = html_content[i+1:tag_end].lower().strip()
-                
-                # Process tag
-                if tag.startswith('script'):
-                    self.in_script = True
-                elif tag == '/script':
-                    self.in_script = False
-                elif tag.startswith('style'):
-                    self.in_style = True
-                elif tag == '/style':
-                    self.in_style = False
-                elif tag.startswith('head'):
-                    self.in_head = True
-                elif tag == '/head':
-                    self.in_head = False
-                elif tag == 'title':
-                    # Extract title
-                    title_end = html_content.find('</title>', tag_end)
-                    if title_end > tag_end:
-                        self.title = html_content[tag_end+1:title_end].strip()
-                elif tag.startswith('a '):
-                    # Extract href
-                    href_match = re.search(r'href=["\'](.*?)["\']', tag)
-                    if href_match:
-                        href = href_match.group(1)
-                        # Handle relative URLs
-                        if href.startswith('/'):
-                            parsed_url = urlparse(self.base_url)
-                            href = f"{parsed_url.scheme}://{parsed_url.netloc}{href}"
-                        elif not href.startswith(('http://', 'https://')):
-                            base_url = self.base_url
-                            if not base_url.endswith('/'):
-                                base_url = '/'.join(base_url.split('/')[:-1]) + '/'
-                            href = base_url + href
-                        
-                        self.current_link = href
-                elif tag == '/a':
-                    self.current_link = None
-                elif tag in ['br', 'p', 'div', '/p', '/div', 'li', '/li']:
-                    self.current_text.append("\n")
-                
-                i = tag_end + 1
-            else:
-                # Accumulate text
-                if not self.in_script and not self.in_style:
-                    self.current_text.append(html_content[i])
-                i += 1
+        sock.close()
+        return response.decode('utf-8', errors='ignore')
+
+    @staticmethod
+    def parse_response(response):
+        headers_raw, _, body = response.partition('\r\n\r\n')
+        headers_lines = headers_raw.split('\r\n')
         
-        # Process any remaining text
-        if self.current_text and not self.in_script and not self.in_style and not self.in_head:
-            text = ''.join(self.current_text).strip()
-            if text:
-                if self.current_link:
-                    self.links.append((text, self.current_link))
+        status_line = headers_lines[0] if headers_lines else ''
+        try:
+            status_code = int(status_line.split()[1]) if status_line else 500
+        except (IndexError, ValueError):
+            status_code = 500
+        
+        headers = {}
+        for line in headers_lines[1:]:
+            if ': ' in line:
+                key, value = line.split(': ', 1)
+                headers[key.lower()] = value
+        
+        # Handle content encoding
+        content_encoding = headers.get('content-encoding', '').lower()
+        if content_encoding == 'gzip':
+            try:
+                body = gzip.GzipFile(fileobj=io.BytesIO(body.encode('latin1'))).read().decode('utf-8')
+            except:
+                pass
+        elif content_encoding == 'deflate':
+            try:
+                body = zlib.decompress(body.encode('latin1')).decode('utf-8')
+            except:
+                pass
+        
+        return {
+            'status_code': status_code,
+            'headers': headers,
+            'body': body
+        }
+
+    @staticmethod
+    def follow_redirects(url, max_redirects=5, headers=None):
+        current_url = url
+        for _ in range(max_redirects):
+            host, path, https = HTTPClient.parse_url(current_url)
+            response = HTTPClient.make_request(host, path, headers, https=https)
+            parsed = HTTPClient.parse_response(response)
+            
+            if parsed['status_code'] in (301, 302, 303, 307, 308):
+                location = parsed['headers'].get('location')
+                if not location:
+                    break
+                
+                if location.startswith('/'):
+                    current_url = f'http{"s" if https else ""}://{host}{location}'
                 else:
-                    self.output_buffer.append(text)
+                    current_url = location
+            else:
+                return parsed['body'], current_url
         
-        return self.create_readable_output()
-    
-    def create_readable_output(self):
-        result = []
-        
-        # Add page title
-        if self.title:
-            result.append(f"Title: {self.title}")
-            result.append("=" * 40)
-        
-        # Add processed text
-        content_added = False
-        for text in self.output_buffer:
-            # Decode HTML entities and clean up whitespace
-            text = html.unescape(text)
-            text = re.sub(r'[ \t]+', ' ', text)
-            text = re.sub(r'\n{3,}', '\n\n', text)
-            if text.strip():
-                result.append(text)
-                content_added = True
-        
-        # Make sure we have at least some content
-        if not content_added:
-            result.append("-")
-        
-        # Add links at the end
-        if self.links:
-            result.append("=" * 40)
-            result.append("Links:")
-            for i, (text, url) in enumerate(self.links, 1):
-                # Clean up link text
-                text = html.unescape(text).strip()
-                text = re.sub(r'\s+', ' ', text)
-                if not text:
-                    text = url
-                result.append(f"{i}. {text}")
-        
-        return '\n'.join(result)
+        return parsed['body'], current_url
 
-# Main functions
-def make_url_request(url):
-    client = HttpClient()
+class CacheManager:
+    CACHE_DIR = '.go2web_cache'
     
-    # Normalize URL first
-    normalized_url = normalize_url(url)
-    if not normalized_url:
-        print(f"Invalid URL: {url}")
-        return
+    @staticmethod
+    def _get_cache_path(key):
+        if not os.path.exists(CacheManager.CACHE_DIR):
+            os.makedirs(CacheManager.CACHE_DIR)
+        safe_key = re.sub(r'[^a-zA-Z0-9]', '_', key)
+        return os.path.join(CacheManager.CACHE_DIR, safe_key)
+    
+    @staticmethod
+    def get(key):
+        path = CacheManager._get_cache_path(key)
+        if os.path.exists(path):
+            with open(path, 'r') as f:
+                data = json.load(f)
+                if data['expiry'] > time.time():
+                    return data['content']
+        return None
+    
+    @staticmethod
+    def set(key, content, ttl=3600):
+        path = CacheManager._get_cache_path(key)
+        data = {
+            'content': content,
+            'expiry': time.time() + ttl
+        }
+        with open(path, 'w') as f:
+            json.dump(data, f)
+
+def clean_text(text):
+    """Clean text by removing excessive whitespace and unescaping HTML entities"""
+    text = html.unescape(text)
+    text = text.replace("\\u003Cstrong>", "").replace("\\u003C/strong>", "")
+    return text
+
+def fetch_url(url):
+    cache_key = f'url:{url}'
+    cached = CacheManager.get(cache_key)
+    if cached:
+        return cached
+    
+    try:
+        headers = {'Accept': 'text/html,application/json'}
+        body, final_url = HTTPClient.follow_redirects(url, headers=headers)
         
-    print(f"Requesting: {normalized_url}")
-    
-    # Enhanced headers for better site compatibility
-    headers = {
-        'User-Agent': USER_AGENT,
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.7',
-        'Accept-Language': 'en-US,en;q=0.9',
-    }
-    
-    headers, body = client.make_request(normalized_url, headers=headers, follow_redirects=True)
-    
-    # Process the content
-    processor = HtmlProcessor(normalized_url)
-    readable_content = processor.process_html(body)
-    print(readable_content)
+        # Handle content type
+        host, path, https = HTTPClient.parse_url(final_url)
+        response = HTTPClient.make_request(host, path, headers, https=https)
+        parsed = HTTPClient.parse_response(response)
+        
+        content_type = parsed['headers'].get('content-type', '').split(';')[0]
+        
+        if content_type == 'application/json':
+            try:
+                data = json.loads(parsed['body'])
+                result = json.dumps(data, indent=2)
+            except json.JSONDecodeError:
+                result = clean_text(parsed['body'])
+        else:
+            # Extract text from HTML
+            extractor = HTMLTextExtractor()
+            extractor.feed(parsed['body'])
+            result = extractor.get_text()
+            result = clean_text(result)
+        
+        CacheManager.set(cache_key, result)
+        return result
+    except Exception as e:
+        return f"Error fetching URL: {str(e)}"
 
 def search_term(term):
-    client = HttpClient()
-    
-    # Prepare search URL
-    search_url = f"https://duckduckgo.com/?q={quote_plus(term)}" 
-    
-    print(f"Searching for: {term}")
-    print(f"Using search URL: {search_url}")
-    
-    headers = {
-        'User-Agent': USER_AGENT,
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-    }
-    
-    _, body = client.make_request(search_url, headers=headers)
-    
-    # Extract and display search results
-    processor = HtmlProcessor(search_url)
-    readable_content = processor.process_html(body)
-    print(f"Search results for '{term}':")
-    print(readable_content)
+    cache_key = f'search:{term}'
+    cached = CacheManager.get(cache_key)
+    if cached:
+        return cached
+   
+    try:
+        # Use Brave Search as an alternative
+        base_url = "https://search.brave.com/search"
+        params = {
+            'q': term,
+            'source': 'web'
+        }
+       
+        headers = {
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept-Language': 'en-US,en;q=0.9',
+        }
+       
+        host, path, https = HTTPClient.parse_url(base_url)
+        query_string = urllib.parse.urlencode(params)
+        full_path = f"{path}?{query_string}"
+       
+        response = HTTPClient.make_request(host, full_path, headers, https=True)
+        parsed_response = HTTPClient.parse_response(response)
+        body = parsed_response['body']
+       
+        # Try to find JSON-like data in the response
+        results = []
+        
+        # First attempt: Look for structured data patterns
+        data_pattern = re.compile(r'\{.*?title:\s*"(?P<title>.*?)".*?url:\s*"(?P<url>.*?)".*?description:\s*"(?P<desc>.*?)".*?\}', re.DOTALL)
+        matches = list(data_pattern.finditer(body))
+        
+        for i, match in enumerate(matches[:10]):
+            title = clean_text(match.group('title'))
+            url = clean_text(match.group('url'))
+            desc = clean_text(match.group('desc'))
+            
+            results.append(f"{i+1}. *{title}*\n   {url}\n   {desc}\n")
+        
+        # Second attempt: If no structured data found, try to find raw JSON
+        if not results:
+            json_pattern = re.compile(r'\{.*?"results":\s*\[(.*?)\].*?\}', re.DOTALL)
+            json_match = json_pattern.search(body)
+            if json_match:
+                try:
+                    # Try to parse the JSON data
+                    json_data = json.loads(f'{{{json_match.group(0)}}}')
+                    if 'results' in json_data:
+                        for i, item in enumerate(json_data['results'][:10]):
+                            title = clean_text(item.get('title', ''))
+                            url = clean_text(item.get('url', ''))
+                            desc = clean_text(item.get('description', ''))
+                            results.append(f"{i+1}. *{title}*\n   {url}\n   {desc}\n")
+                except json.JSONDecodeError:
+                    pass
+        
+        # Fallback to HTML parsing if no structured data found
+        if not results:
+            # HTML fallback parsing (similar to original but improved)
+            result_pattern = re.compile(
+                r'<div[^>]*class=".*?result.*?".*?>.*?'
+                r'<a[^>]*href="([^"]*)"[^>]*>.*?'
+                r'<h3[^>]*>(.*?)</h3>.*?'
+                r'<p[^>]*>(.*?)</p>',
+                re.DOTALL
+            )
+            matches = list(result_pattern.finditer(body))
+            
+            for i, match in enumerate(matches[:10]):
+                url = clean_text(match.group(1).strip())
+                title = clean_text(match.group(2).strip())
+                snippet = clean_text(match.group(3).strip())
+                results.append(f"{i+1}. *{title}*\n   {url}\n   {snippet}\n")
+       
+        if not results:
+            return "No results found. Try a different search term."
+       
+        result = "Top Results:\n" + '\n'.join(results)
+        CacheManager.set(cache_key, result)
+        return result
+       
+    except Exception as e:
+        return f"Search error: {str(e)}"
 
-# Main entry point
 def main():
-    parser = argparse.ArgumentParser(
-        description='Web request CLI tool without using HTTP libraries'
-    )
+    parser = ArgumentParser(
+        description='go2web - a simple CLI web utility',
+        formatter_class=RawDescriptionHelpFormatter,
+        epilog='''Examples:
+  go2web -u example.com
+  go2web -s "search term"
+  go2web -u https://api.example.com/data.json''')
     
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument('-u', '--url', help='Make an HTTP request to the specified URL')
-    group.add_argument('-s', '--search', help='Search the term using a search engine')
-    group.add_argument('--clear-cache', action='store_true', help='Clear the cache')
+    parser.add_argument('-u', '--url', help='make an HTTP request to the specified URL and print the response')
+    parser.add_argument('-s', '--search', help='search the term using DuckDuckGo and print top results', nargs='+')
+    parser.add_argument('-l', '--link', type=int, help='open a link from the last search results (1-10)')
     
     args = parser.parse_args()
     
-    if args.clear_cache:
-        import shutil
-        if os.path.exists(CACHE_DIR):
-            shutil.rmtree(CACHE_DIR)
-            os.makedirs(CACHE_DIR)
-        print("Cache cleared successfully.")
-    elif args.url:
-        make_url_request(args.url)
-    elif args.search:
-        search_term(args.search)
+    if not any(vars(args).values()):
+        parser.print_help()
+        sys.exit(1)
+    
+    if args.url:
+        result = fetch_url(args.url)
+        print(result)
+    
+    if args.search:
+        term = ' '.join(args.search)
+        result = search_term(term)
+        print(result)
+        
+        if args.link:
+            # Extract URLs from search results
+            urls = re.findall(r'https?://[^\s]+', result)
+            if 1 <= args.link <= len(urls):
+                selected_url = urls[args.link-1]
+                print(f"\nFetching link #{args.link}: {selected_url}\n")
+                print(fetch_url(selected_url))
+            else:
+                print(f"Invalid link number. Choose between 1-{len(urls)}")
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

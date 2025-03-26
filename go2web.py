@@ -216,6 +216,16 @@ class CacheManager:
         }
         with open(path, 'w') as f:
             json.dump(data, f)
+            
+    @staticmethod
+    def clear():
+        if os.path.exists(CacheManager.CACHE_DIR):
+            for filename in os.listdir(CacheManager.CACHE_DIR):
+                file_path = os.path.join(CacheManager.CACHE_DIR, filename)
+                os.remove(file_path)
+            print("Cache cleared successfully.")
+        else:
+            print("Cache directory does not exist.")
 
 def clean_text(text):
     """Clean text by removing excessive whitespace and unescaping HTML entities"""
@@ -357,12 +367,17 @@ def main():
     parser.add_argument('-u', '--url', help='make an HTTP request to the specified URL and print the response')
     parser.add_argument('-s', '--search', help='search the term using DuckDuckGo and print top results', nargs='+')
     parser.add_argument('-l', '--link', type=int, help='open a link from the last search results (1-10)')
+    parser.add_argument("-c", "--clear-cache", action="store_true", help="Clear the cache")
     
     args = parser.parse_args()
     
     if not any(vars(args).values()):
         parser.print_help()
         sys.exit(1)
+        
+    if args.clear_cache:
+        CacheManager.clear()
+        sys.exit(0)
     
     if args.url:
         result = fetch_url(args.url)

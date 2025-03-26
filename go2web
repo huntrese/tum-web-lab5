@@ -4,4 +4,4 @@
 SCRIPT_PATH="$(dirname "$(readlink -f "$0")")/go2web.py"
 
 # Execute the Python script with all arguments passed to this script
-python3 "$SCRIPT_PATH" "$@"
+python "$SCRIPT_PATH" "$@"

@@ -14,6 +14,13 @@ import zlib
 import html
 from argparse import ArgumentParser, RawDescriptionHelpFormatter
 
+# Platform detection for browser opening
+import platform
+import subprocess
+
+# Detect if we're running on Windows
+IS_WINDOWS = platform.system() == 'Windows'
+
 class HTMLTextExtractor(HTMLParser):
     def __init__(self):
         super().__init__()
@@ -355,6 +362,24 @@ def search_term(term):
     except Exception as e:
         return f"Search error: {str(e)}"
 
+def open_in_browser(url):
+    """Open URL in the default browser"""
+    try:
+        if IS_WINDOWS:
+            # Windows-specific command to open URL
+            subprocess.run(['start', url], shell=True, check=True)
+        else:
+            # Linux/Mac command to open URL
+            # Use appropriate command based on platform
+            if platform.system() == 'Darwin':  # macOS
+                subprocess.run(['open', url], check=True)
+            else:  # Linux and others
+                subprocess.run(['xdg-open', url], check=True)
+        return True
+    except Exception as e:
+        print(f"Error opening URL: {str(e)}")
+        return False
+
 def main():
     parser = ArgumentParser(
         description='go2web - a simple CLI web utility',
@@ -362,11 +387,13 @@ def main():
         epilog='''Examples:
   go2web -u example.com
   go2web -s "search term"
-  go2web -u https://api.example.com/data.json''')
+  go2web -u https://api.example.com/data.json
+  go2web -s "python" -o 2  (open second search result in browser)''')
     
     parser.add_argument('-u', '--url', help='make an HTTP request to the specified URL and print the response')
-    parser.add_argument('-s', '--search', help='search the term using DuckDuckGo and print top results', nargs='+')
+    parser.add_argument('-s', '--search', help='search the term using Brave Search and print top results', nargs='+')
     parser.add_argument('-l', '--link', type=int, help='open a link from the last search results (1-10)')
+    parser.add_argument('-o', '--open', type=int, help='open the specified search result in browser (1-10)')
     parser.add_argument("-c", "--clear-cache", action="store_true", help="Clear the cache")
     
     args = parser.parse_args()
@@ -388,13 +415,27 @@ def main():
         result = search_term(term)
         print(result)
         
+        # Extract URLs from search results for potential use with -l or -o
+        urls = re.findall(r'https?://[^\s]+', result)
+        
         if args.link:
-            # Extract URLs from search results
-            urls = re.findall(r'https?://[^\s]+', result)
+            # Display content from the selected URL
             if 1 <= args.link <= len(urls):
                 selected_url = urls[args.link-1]
                 print(f"\nFetching link #{args.link}: {selected_url}\n")
                 print(fetch_url(selected_url))
+            else:
+                print(f"Invalid link number. Choose between 1-{len(urls)}")
+                
+        if args.open:
+            # Open the URL in browser
+            if 1 <= args.open <= len(urls):
+                selected_url = urls[args.open-1]
+                print(f"\nOpening link #{args.open} in browser: {selected_url}")
+                if open_in_browser(selected_url):
+                    print("Browser opened successfully.")
+                else:
+                    print("Failed to open browser. Copy the URL manually.")
             else:
                 print(f"Invalid link number. Choose between 1-{len(urls)}")
 

@@ -1,320 +1,443 @@
 #!/usr/bin/env python3
-import argparse
+import sys
 import socket
-import ssl
+import urllib.parse
 import re
-import os
+from html.parser import HTMLParser
 import json
+import os
 import time
-from urllib.parse import urlparse, urlencode, quote_plus
+import ssl
+import gzip
+import io
+import zlib
+import html
+from argparse import ArgumentParser, RawDescriptionHelpFormatter
 
-# Constants
-USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/113.0.0.0 Safari/537.36"
-CACHE_DIR = os.path.join(os.path.expanduser("~"), ".go2web_cache")
-CACHE_EXPIRY = 3600  # Cache expiry in seconds (1 hour)
+# Platform detection for browser opening
+import platform
+import subprocess
 
-# HTML tag stripping regex
-HTML_TAG_PATTERN = re.compile(r'<[^>]+>')
+# Detect if we're running on Windows
+IS_WINDOWS = platform.system() == 'Windows'
 
-# Cache mechanism
-class HttpCache:
+class HTMLTextExtractor(HTMLParser):
     def __init__(self):
-        if not os.path.exists(CACHE_DIR):
-            os.makedirs(CACHE_DIR)
-    
-    def _get_cache_filename(self, url):
-        return os.path.join(CACHE_DIR, quote_plus(url))
-    
-    def get(self, url):
-        cache_file = self._get_cache_filename(url)
-        if os.path.exists(cache_file):
-            # Check if cache is still valid
-            file_time = os.path.getmtime(cache_file)
-            if time.time() - file_time < CACHE_EXPIRY:
-                with open(cache_file, 'r', encoding='utf-8', errors='replace') as f:
-                    cached_data = json.load(f)
-                    return cached_data['headers'], cached_data['content']
-        return None, None
-    
-    def set(self, url, headers, content):
-        cache_file = self._get_cache_filename(url)
-        with open(cache_file, 'w', encoding='utf-8') as f:
-            json.dump({
-                'headers': headers,
-                'content': content
-            }, f)
+        super().__init__()
+        self.reset()
+        self.strict = False
+        self.convert_charrefs = True
+        self.text = []
+        self.skip_tags = ['script', 'style', 'head', 'meta', 'link']
+        self.current_tag = None
+        self.current_attrs = None
+        self.bold = False
+        self.italic = False
+        self.link_url = None
 
-# HTTP client
-class HttpClient:
-    def __init__(self):
-        self.cache = HttpCache()
-    
-    def make_request(self, url, headers=None, follow_redirects=True, accept=None):
-        # Check cache first
-        cached_headers, cached_content = self.cache.get(url)
-        if cached_content:
-            return cached_headers, cached_content
+    def handle_starttag(self, tag, attrs):
+        self.current_tag = tag
+        self.current_attrs = dict(attrs)
         
-        # Parse URL
-        parsed_url = urlparse(url)
-        host = parsed_url.netloc
-        path = parsed_url.path if parsed_url.path else "/"
+        if tag == 'strong' or tag == 'b':
+            self.bold = True
+        elif tag == 'em' or tag == 'i':
+            self.italic = True
+        elif tag == 'a' and 'href' in self.current_attrs:
+            self.link_url = self.current_attrs['href']
+            
+
+    def handle_endtag(self, tag):
+        if tag == 'strong' or tag == 'b':
+            self.bold = False
+        elif tag == 'em' or tag == 'i':
+            self.italic = False
+        elif tag == 'a':
+            self.link_url = None
+            
+        self.current_tag = None
+        if tag in ['p', 'br', 'div', 'section', 'article', 'li']:
+            self.text.append('\n')
+
+    def handle_data(self, d):
+        if self.current_tag not in self.skip_tags and d.strip():
+            text = d.strip()
+            
+            # Apply formatting
+            if self.bold:
+                text = f'*{text}*'
+            if self.italic:
+                text = f'_{text}_'
+                
+            # Handle links
+            if self.link_url and self.current_tag == 'a':
+                text = f'{text} ({self.link_url})'
+                
+            self.text.append(text.strip())
+
+    def get_text(self):
+        return ' '.join(self.text)
+
+class HTTPClient:
+    @staticmethod
+    def parse_url(url):
+        if not url.startswith('http://') and not url.startswith('https://'):
+            url = 'http://' + url
         
-        if parsed_url.query:
-            path += "?" + parsed_url.query
+        parsed = urllib.parse.urlparse(url)
+        host = parsed.netloc
+        path = parsed.path if parsed.path else '/'
+        if parsed.query:
+            path += '?' + parsed.query
+        return host, path, parsed.scheme == 'https'
+
+    @staticmethod
+    def make_request(host, path, headers=None, method='GET', https=False):
+        port = 443 if https else 80
         
-        # Default port
-        port = 443 if parsed_url.scheme == "https" else 80
-        
-        # Override port if specified in URL
-        if ":" in host:
-            host, port_str = host.split(":")
-            port = int(port_str)
-        
-        # Prepare custom headers
-        if headers is None:
-            headers = {}
-        
-        if 'User-Agent' not in headers:
-            headers['User-Agent'] = USER_AGENT
-        
-        if 'Host' not in headers:
-            headers['Host'] = host
-        
-        if accept and 'Accept' not in headers:
-            headers['Accept'] = accept
-        
-        # Create request
-        request = f"GET {path} HTTP/1.1\r\n"
-        request += f"Host: {host}\r\n"
-        
-        for header_name, header_value in headers.items():
-            request += f"{header_name}: {header_value}\r\n"
-        
-        request += "Connection: close\r\n\r\n"
-        
-        # Connect to the server
+        # Create socket connection
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(10)
         
-        try:
-            if parsed_url.scheme == "https":
-                context = ssl.create_default_context()
-                sock = context.wrap_socket(sock, server_hostname=host)
-            
-            sock.connect((host, port))
-            sock.sendall(request.encode())
-            
-            # Receive the response
-            response = b""
-            while True:
-                data = sock.recv(4096)
-                if not data:
+        if https:
+            context = ssl.create_default_context()
+            sock = context.wrap_socket(sock, server_hostname=host)
+        
+        sock.connect((host, port))
+        
+        # Build request
+        request_lines = [
+            f'{method} {path} HTTP/1.1',
+            f'Host: {host}',
+            'Connection: close',
+            'User-Agent: go2web/1.0'
+        ]
+        
+        if headers:
+            for key, value in headers.items():
+                request_lines.append(f'{key}: {value}')
+        
+        request = '\r\n'.join(request_lines) + '\r\n\r\n'
+        
+        # Send request
+        sock.sendall(request.encode())
+        
+        # Receive response
+        response = b''
+        while True:
+            try:
+                chunk = sock.recv(4096)
+                if not chunk:
                     break
-                response += data
-            
-            # Parse the response
-            response_str = response.decode('utf-8', errors='replace')
-            
-            # Split headers and body
-            header_end = response_str.find("\r\n\r\n")
-            if header_end == -1:
-                raise Exception("Invalid HTTP response")
-            
-            headers_str = response_str[:header_end]
-            body = response_str[header_end + 4:]
-            
-            # Parse headers
-            headers_lines = headers_str.split("\r\n")
-            status_line = headers_lines[0]
-            headers = {}
-            
-            for line in headers_lines[1:]:
-                if ": " in line:
-                    name, value = line.split(": ", 1)
-                    headers[name.lower()] = value
-            
-            # Check for redirect
-            status_code = int(status_line.split(" ")[1])
-            if follow_redirects and status_code in (301, 302, 303, 307, 308) and 'location' in headers:
-                redirect_url = headers['location']
-                
-                # Handle relative URLs
-                if redirect_url.startswith('/'):
-                    redirect_url = f"{parsed_url.scheme}://{host}{redirect_url}"
-                
-                print(f"Redirecting to: {redirect_url}")
-                return self.make_request(redirect_url, headers, follow_redirects, accept)
-            
-            # Check for transfer-encoding: chunked
-            if headers.get('transfer-encoding') == 'chunked':
-                body = self._decode_chunked(body)
-            
-            # Handle content encodings if needed (future improvement)
-            
-            # Content negotiation - check Content-Type
-            content_type = headers.get('content-type', '')
-            
-            # Cache the response
-            self.cache.set(url, headers, body)
-            
-            return headers, body
-        
-        finally:
-            sock.close()
-    
-    def _decode_chunked(self, body):
-        # Simplified chunked decoding
-        result = ""
-        remaining = body
-        
-        while remaining:
-            # Find the chunk size line
-            chunk_size_end = remaining.find("\r\n")
-            if chunk_size_end == -1:
+                response += chunk
+            except socket.timeout:
                 break
-            
-            # Parse chunk size (hex)
-            chunk_size_line = remaining[:chunk_size_end]
-            chunk_size = int(chunk_size_line.split(";")[0], 16)
-            
-            # End of chunks
-            if chunk_size == 0:
-                break
-            
-            # Extract chunk data
-            chunk_start = chunk_size_end + 2
-            chunk_end = chunk_start + chunk_size
-            
-            # Check if we have the complete chunk
-            if len(remaining) < chunk_end + 2:
-                break
-            
-            # Add chunk data to result
-            result += remaining[chunk_start:chunk_end]
-            
-            # Move to next chunk
-            remaining = remaining[chunk_end + 2:]
         
-        return result
+        sock.close()
+        return response.decode('utf-8', errors='ignore')
 
-# Content processing
-def strip_html_tags(html):
-    """Remove HTML tags from text"""
-    # First, clean up some common entities
-    text = html.replace('&nbsp;', ' ').replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>')
-    
-    # Then remove all tags
-    text = HTML_TAG_PATTERN.sub('', text)
-    
-    # Clean up whitespace
-    lines = text.split('\n')
-    cleaned_lines = []
-    
-    for line in lines:
-        line = line.strip()
-        if line:
-            cleaned_lines.append(line)
-    
-    return '\n'.join(cleaned_lines)
+    @staticmethod
+    def parse_response(response):
+        headers_raw, _, body = response.partition('\r\n\r\n')
+        headers_lines = headers_raw.split('\r\n')
+        
+        status_line = headers_lines[0] if headers_lines else ''
+        try:
+            status_code = int(status_line.split()[1]) if status_line else 500
+        except (IndexError, ValueError):
+            status_code = 500
+        
+        headers = {}
+        for line in headers_lines[1:]:
+            if ': ' in line:
+                key, value = line.split(': ', 1)
+                headers[key.lower()] = value
+        
+        # Handle content encoding
+        content_encoding = headers.get('content-encoding', '').lower()
+        if content_encoding == 'gzip':
+            try:
+                body = gzip.GzipFile(fileobj=io.BytesIO(body.encode('latin1'))).read().decode('utf-8')
+            except:
+                pass
+        elif content_encoding == 'deflate':
+            try:
+                body = zlib.decompress(body.encode('latin1')).decode('utf-8')
+            except:
+                pass
+        
+        return {
+            'status_code': status_code,
+            'headers': headers,
+            'body': body
+        }
 
-def format_json(json_str):
-    """Format JSON content for readability"""
+    @staticmethod
+    def follow_redirects(url, max_redirects=5, headers=None):
+        current_url = url
+        for _ in range(max_redirects):
+            host, path, https = HTTPClient.parse_url(current_url)
+            response = HTTPClient.make_request(host, path, headers, https=https)
+            parsed = HTTPClient.parse_response(response)
+            
+            if parsed['status_code'] in (301, 302, 303, 307, 308):
+                location = parsed['headers'].get('location')
+                if not location:
+                    break
+                
+                if location.startswith('/'):
+                    current_url = f'http{"s" if https else ""}://{host}{location}'
+                else:
+                    current_url = location
+            else:
+                return parsed['body'], current_url
+        
+        return parsed['body'], current_url
+
+class CacheManager:
+    CACHE_DIR = '.go2web_cache'
+    
+    @staticmethod
+    def _get_cache_path(key):
+        if not os.path.exists(CacheManager.CACHE_DIR):
+            os.makedirs(CacheManager.CACHE_DIR)
+        safe_key = re.sub(r'[^a-zA-Z0-9]', '_', key)
+        return os.path.join(CacheManager.CACHE_DIR, safe_key)
+    
+    @staticmethod
+    def get(key):
+        path = CacheManager._get_cache_path(key)
+        if os.path.exists(path):
+            with open(path, 'r') as f:
+                data = json.load(f)
+                if data['expiry'] > time.time():
+                    return data['content']
+        return None
+    
+    @staticmethod
+    def set(key, content, ttl=3600):
+        path = CacheManager._get_cache_path(key)
+        data = {
+            'content': content,
+            'expiry': time.time() + ttl
+        }
+        with open(path, 'w') as f:
+            json.dump(data, f)
+            
+    @staticmethod
+    def clear():
+        if os.path.exists(CacheManager.CACHE_DIR):
+            for filename in os.listdir(CacheManager.CACHE_DIR):
+                file_path = os.path.join(CacheManager.CACHE_DIR, filename)
+                os.remove(file_path)
+            print("Cache cleared successfully.")
+        else:
+            print("Cache directory does not exist.")
+
+def clean_text(text):
+    """Clean text by removing excessive whitespace and unescaping HTML entities"""
+    text = html.unescape(text)
+    text = text.replace("\\u003Cstrong>", "").replace("\\u003C/strong>", "")
+    return text
+
+def fetch_url(url):
+    cache_key = f'url:{url}'
+    cached = CacheManager.get(cache_key)
+    if cached:
+        return cached
+    
     try:
-        parsed = json.loads(json_str)
-        return json.dumps(parsed, indent=2)
-    except json.JSONDecodeError:
-        return json_str
-
-def extract_search_results(html):
-    """Extract search results from Google HTML"""
-    results = []
-    
-    # Very simple extraction of search results - this is a basic implementation
-    # A proper implementation would use a dedicated HTML parser
-    links = re.finditer(r'<a href="(https?://[^"]+)"[^>]*>(.*?)</a>', html)
-    
-    for match in links:
-        url = match.group(1)
-        title = strip_html_tags(match.group(2))
+        headers = {'Accept': 'text/html,application/json'}
+        body, final_url = HTTPClient.follow_redirects(url, headers=headers)
         
-        # Skip Google's internal links
-        if 'google.com' in url or not title.strip():
-            continue
+        # Handle content type
+        host, path, https = HTTPClient.parse_url(final_url)
+        response = HTTPClient.make_request(host, path, headers, https=https)
+        parsed = HTTPClient.parse_response(response)
         
-        results.append({
-            'url': url,
-            'title': title
-        })
+        content_type = parsed['headers'].get('content-type', '').split(';')[0]
         
-        if len(results) >= 10:
-            break
-    
-    return results
-
-# Main functions
-def make_url_request(url):
-    client = HttpClient()
-    
-    # Try different content types for content negotiation
-    accept_headers = "text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.8"
-    
-    headers, body = client.make_request(url, accept=accept_headers, follow_redirects=True)
-    
-    # Detect content type
-    content_type = headers.get('content-type', '').lower()
-    
-    if 'application/json' in content_type:
-        # Format JSON for better readability
-        print(format_json(body))
-    else:
-        # Assume HTML or plain text
-        print(strip_html_tags(body))
+        if content_type == 'application/json':
+            try:
+                data = json.loads(parsed['body'])
+                result = json.dumps(data, indent=2)
+            except json.JSONDecodeError:
+                result = clean_text(parsed['body'])
+        else:
+            # Extract text from HTML
+            extractor = HTMLTextExtractor()
+            extractor.feed(parsed['body'])
+            result = extractor.get_text()
+            result = clean_text(result)
+        
+        CacheManager.set(cache_key, result)
+        return result
+    except Exception as e:
+        return f"Error fetching URL: {str(e)}"
 
 def search_term(term):
-    client = HttpClient()
-    
-    # Prepare search URL
-    search_url = f"https://www.google.com/search?q={quote_plus(term)}"
-    
-    headers = {
-        'Accept': 'text/html',
-        'User-Agent': USER_AGENT
-    }
-    
-    _, body = client.make_request(search_url, headers=headers)
-    
-    # Extract and display search results
-    results = extract_search_results(body)
-    
-    if not results:
-        print("No search results found or could not parse results properly.")
-        return
-    
-    print(f"Top {len(results)} results for '{term}':\n")
-    
-    for i, result in enumerate(results, 1):
-        print(f"{i}. {result['title']}")
-        print(f"   {result['url']}")
-        print()
+    cache_key = f'search:{term}'
+    cached = CacheManager.get(cache_key)
+    if cached:
+        return cached
+   
+    try:
+        # Use Brave Search as an alternative
+        base_url = "https://search.brave.com/search"
+        params = {
+            'q': term,
+            'source': 'web'
+        }
+       
+        headers = {
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept-Language': 'en-US,en;q=0.9',
+        }
+       
+        host, path, https = HTTPClient.parse_url(base_url)
+        query_string = urllib.parse.urlencode(params)
+        full_path = f"{path}?{query_string}"
+       
+        response = HTTPClient.make_request(host, full_path, headers, https=True)
+        parsed_response = HTTPClient.parse_response(response)
+        body = parsed_response['body']
+       
+        # Try to find JSON-like data in the response
+        results = []
+        
+        # First attempt: Look for structured data patterns
+        data_pattern = re.compile(r'\{.*?title:\s*"(?P<title>.*?)".*?url:\s*"(?P<url>.*?)".*?description:\s*"(?P<desc>.*?)".*?\}', re.DOTALL)
+        matches = list(data_pattern.finditer(body))
+        
+        for i, match in enumerate(matches[:10]):
+            title = clean_text(match.group('title'))
+            url = clean_text(match.group('url'))
+            desc = clean_text(match.group('desc'))
+            
+            results.append(f"{i+1}. *{title}*\n   {url}\n   {desc}\n")
+        
+        # Second attempt: If no structured data found, try to find raw JSON
+        if not results:
+            json_pattern = re.compile(r'\{.*?"results":\s*\[(.*?)\].*?\}', re.DOTALL)
+            json_match = json_pattern.search(body)
+            if json_match:
+                try:
+                    # Try to parse the JSON data
+                    json_data = json.loads(f'{{{json_match.group(0)}}}')
+                    if 'results' in json_data:
+                        for i, item in enumerate(json_data['results'][:10]):
+                            title = clean_text(item.get('title', ''))
+                            url = clean_text(item.get('url', ''))
+                            desc = clean_text(item.get('description', ''))
+                            results.append(f"{i+1}. *{title}*\n   {url}\n   {desc}\n")
+                except json.JSONDecodeError:
+                    pass
+        
+        # Fallback to HTML parsing if no structured data found
+        if not results:
+            # HTML fallback parsing (similar to original but improved)
+            result_pattern = re.compile(
+                r'<div[^>]*class=".*?result.*?".*?>.*?'
+                r'<a[^>]*href="([^"]*)"[^>]*>.*?'
+                r'<h3[^>]*>(.*?)</h3>.*?'
+                r'<p[^>]*>(.*?)</p>',
+                re.DOTALL
+            )
+            matches = list(result_pattern.finditer(body))
+            
+            for i, match in enumerate(matches[:10]):
+                url = clean_text(match.group(1).strip())
+                title = clean_text(match.group(2).strip())
+                snippet = clean_text(match.group(3).strip())
+                results.append(f"{i+1}. *{title}*\n   {url}\n   {snippet}\n")
+       
+        if not results:
+            return "No results found. Try a different search term."
+       
+        result = "Top Results:\n" + '\n'.join(results)
+        CacheManager.set(cache_key, result)
+        return result
+       
+    except Exception as e:
+        return f"Search error: {str(e)}"
 
-# Main entry point
+def open_in_browser(url):
+    """Open URL in the default browser"""
+    try:
+        if IS_WINDOWS:
+            # Windows-specific command to open URL
+            subprocess.run(['start', url], shell=True, check=True)
+        else:
+            # Linux/Mac command to open URL
+            # Use appropriate command based on platform
+            if platform.system() == 'Darwin':  # macOS
+                subprocess.run(['open', url], check=True)
+            else:  # Linux and others
+                subprocess.run(['xdg-open', url], check=True)
+        return True
+    except Exception as e:
+        print(f"Error opening URL: {str(e)}")
+        return False
+
 def main():
-    parser = argparse.ArgumentParser(
-        description='Web request CLI tool without using HTTP libraries',
-        formatter_class=argparse.RawTextHelpFormatter
-    )
+    parser = ArgumentParser(
+        description='go2web - a simple CLI web utility',
+        formatter_class=RawDescriptionHelpFormatter,
+        epilog='''Examples:
+  go2web -u example.com
+  go2web -s "search term"
+  go2web -u https://api.example.com/data.json
+  go2web -s "python" -o 2  (open second search result in browser)''')
     
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument('-u', '--url', help='Make an HTTP request to the specified URL')
-    group.add_argument('-s', '--search', help='Search the term using Google search engine')
+    parser.add_argument('-u', '--url', help='make an HTTP request to the specified URL and print the response')
+    parser.add_argument('-s', '--search', help='search the term using Brave Search and print top results', nargs='+')
+    parser.add_argument('-l', '--link', type=int, help='open a link from the last search results (1-10)')
+    parser.add_argument('-o', '--open', type=int, help='open the specified search result in browser (1-10)')
+    parser.add_argument("-c", "--clear-cache", action="store_true", help="Clear the cache")
     
     args = parser.parse_args()
     
+    if not any(vars(args).values()):
+        parser.print_help()
+        sys.exit(1)
+        
+    if args.clear_cache:
+        CacheManager.clear()
+        sys.exit(0)
+    
     if args.url:
-        make_url_request(args.url)
-    elif args.search:
-        search_term(args.search)
+        result = fetch_url(args.url)
+        print(result)
+    
+    if args.search:
+        term = ' '.join(args.search)
+        result = search_term(term)
+        print(result)
+        
+        # Extract URLs from search results for potential use with -l or -o
+        urls = re.findall(r'https?://[^\s]+', result)
+        
+        if args.link:
+            # Display content from the selected URL
+            if 1 <= args.link <= len(urls):
+                selected_url = urls[args.link-1]
+                print(f"\nFetching link #{args.link}: {selected_url}\n")
+                print(fetch_url(selected_url))
+            else:
+                print(f"Invalid link number. Choose between 1-{len(urls)}")
+                
+        if args.open:
+            # Open the URL in browser
+            if 1 <= args.open <= len(urls):
+                selected_url = urls[args.open-1]
+                print(f"\nOpening link #{args.open} in browser: {selected_url}")
+                if open_in_browser(selected_url):
+                    print("Browser opened successfully.")
+                else:
+                    print("Failed to open browser. Copy the URL manually.")
+            else:
+                print(f"Invalid link number. Choose between 1-{len(urls)}")
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
